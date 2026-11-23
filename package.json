@@ -1,0 +1,1 @@
+{ "name": "muriel-server", "version": "1.3.4", "private": true, "scripts": { "start": "node start.js" } }
