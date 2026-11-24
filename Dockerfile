@@ -16,6 +16,7 @@ COPY . .
 ENV HOME=/data \
     MURIEL_DATA_DIR=/data/muriel \
     HOST=0.0.0.0 \
+    YT_JS_RUNTIME=node \
     NODE_ENV=production
 RUN mkdir -p /data
 

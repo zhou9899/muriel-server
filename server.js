@@ -2983,6 +2983,27 @@ async function handleDownload(req, res, trackUrl, title, artist, format = 'mp3',
         directory: downloadsDir
       });
     } catch (e2) {
+      const failText = String((e2 && e2.message) || (err && err.message) || '');
+      // YouTube refuses datacenter IPs ("not a bot"): look the song up on SoundCloud instead of failing
+      if (/sign in to confirm|not a bot/i.test(failText) && process.env.MURIEL_NO_FALLBACK !== '1'
+          && (title || artist) && !/^scsearch/.test(String(targetUrl))) {
+        try {
+          const scArgs = args.slice(0, args.lastIndexOf('--'));
+          const ei = scArgs.indexOf('--extractor-args');
+          if (ei !== -1) scArgs.splice(ei, 2);
+          scArgs.push('--', `scsearch1:${cleanArtist === 'unknown artist' ? '' : cleanArtist + ' '}${cleanTitle}`);
+          await executeYtDlp(scArgs, 90000, { onChild: c => { child = c; } });
+          if (!isRaw) {
+            await cleanupDownloadArtifacts(downloadsDir, beforeFiles, baseName, videoId, ext, true);
+            downloadsIndex = null;
+          }
+          sendDownloadResponse(200, isRaw ? { success: true, tempName: tempName, source: 'soundcloud' }
+            : { success: true, filename: outFilename, directory: downloadsDir, source: 'soundcloud' });
+          return;
+        } catch (e3) {
+          try { logger.error('SoundCloud fallback failed: ' + (e3.message || e3)); } catch (_) {}
+        }
+      }
       if (!isRaw) {
         await cleanupDownloadArtifacts(downloadsDir, beforeFiles, baseName, videoId, ext, false);
       } else {
@@ -3307,7 +3328,9 @@ const TOKEN_PROTECTED_ROUTES = new Set([
   '/api/encode',
   '/api/apple-import',
   '/api/playlist-import',
-  '/api/yandex-import'
+  '/api/yandex-import',
+  '/api/yt-status',
+  '/api/yt-cookies'
 ]);
 
 // Every route needs the token: any web page the user visits can send requests to 127.0.0.1, so a route without
@@ -6076,6 +6099,43 @@ const server = http.createServer(guardHandler(async (req, res) => {
       cached: !!cachedFile, 
       streamUrl: cachedFile ? withToken(`http://127.0.0.1:${PORT}/api/local-track?id=${encodeURIComponent(cleanId)}`) : null 
     }));
+  }
+
+  if (parsedUrl.pathname === '/api/yt-status') {
+    const plat = require('./platform');
+    const info = plat.cookiesInfo();
+    const out = { success: true, cookies: info, proxy: !!process.env.YT_PROXY, jsRuntime: process.env.YT_JS_RUNTIME || null };
+    if (parsedUrl.query.check) {
+      try {
+        const t = await executeYtDlp(['--no-warnings', '--no-playlist', '--simulate', '--print', '%(title)s', '--', 'https://www.youtube.com/watch?v=jNQXAC9IVRw'], 40000);
+        out.youtube = { ok: true, title: String(t).trim().slice(0, 80) };
+      } catch (e) {
+        out.youtube = { ok: false, error: String(e.message || e).slice(0, 300) };
+      }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(out));
+  }
+
+  if (parsedUrl.pathname === '/api/yt-cookies' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { if (res.writableEnded) return; body += chunk; if (body.length > 400000) { body = ''; req.removeAllListeners('data'); req.removeAllListeners('end'); res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: false, error: 'payload too large' })); req.resume(); } });
+    req.on('end', () => {
+      try {
+        let text = body;
+        const trimmed = body.trim();
+        if (trimmed.startsWith('{')) { const j = JSON.parse(trimmed); text = j.cookies_b64 ? Buffer.from(String(j.cookies_b64), 'base64').toString('utf8') : String(j.cookies || ''); }
+        else if (!trimmed.includes('\t') && /^[A-Za-z0-9+/=\s]+$/.test(trimmed)) text = Buffer.from(trimmed, 'base64').toString('utf8');
+        const plat = require('./platform');
+        const n = plat.saveCookieText(text);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, saved: n, cookies: plat.cookiesInfo() }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: String(e.message || e) }));
+      }
+    });
+    return;
   }
 
   if (parsedUrl.pathname === '/api/tools-status') {

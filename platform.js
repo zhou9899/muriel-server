@@ -177,14 +177,88 @@ function ytDlpCommand(args) {
   // YouTube's player checks need a JavaScript runtime, and without one yt-dlp sees fewer (lower quality)
   // formats. Electron runs as plain Node when ELECTRON_RUN_AS_NODE is set, so the app is the runtime.
   const js = process.versions && process.versions.electron && process.execPath ? ['--js-runtimes', `node:${process.execPath}`] : [];
-  return { bin, args: extra.concat(js, args), env: js.length ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' } : process.env };
+  const net = ytDlpNetworkArgs();
+  return { bin, args: extra.concat(js, net, args), env: js.length ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' } : process.env };
+}
+
+// Cloud hosts (Railway and the like) get "Sign in to confirm you're not a bot" from YouTube. These env vars let
+// yt-dlp present cookies, go through a proxy, or use a named JS runtime:
+//   YT_COOKIES_B64   base64 of a Netscape cookies.txt          YT_COOKIES_FILE  path to a cookies.txt
+//   YT_COOKIES       the cookies.txt text itself               YT_PROXY         e.g. http://user:pass@host:port
+//   YT_JS_RUNTIME    e.g. node (newer yt-dlp needs one for YouTube)
+let cookiesPathCache = null;
+const nodeCrypto = require('crypto');
+function cookieJarFile() { return path.join(DATA_DIR, 'yt-cookies.txt'); }
+function resetCookiesCache() { cookiesPathCache = null; }
+
+// The jar lives in DATA_DIR so yt-dlp's own refreshes survive restarts. An env value only replaces the jar when
+// the env value itself changed (so pasting new cookies into Railway still takes effect on the next deploy).
+function cookiesPath() {
+  if (cookiesPathCache !== null) return cookiesPathCache || null;
+  cookiesPathCache = '';
+  try {
+    let text = '';
+    if (process.env.YT_COOKIES_B64) text = Buffer.from(process.env.YT_COOKIES_B64.trim(), 'base64').toString('utf8');
+    else if (process.env.YT_COOKIES) text = process.env.YT_COOKIES.replace(/\\n/g, '\n');
+    else if (process.env.YT_COOKIES_FILE && fs.existsSync(process.env.YT_COOKIES_FILE)) text = fs.readFileSync(process.env.YT_COOKIES_FILE, 'utf8');
+    const dest = cookieJarFile();
+    const marker = dest + '.src';
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (text.trim()) {
+      const hash = nodeCrypto.createHash('sha1').update(text).digest('hex');
+      let seen = '';
+      try { seen = fs.readFileSync(marker, 'utf8').trim(); } catch (_) {}
+      if (seen !== hash || !fs.existsSync(dest)) {
+        fs.writeFileSync(dest, text, { mode: 0o600 });
+        fs.writeFileSync(marker, hash);
+      }
+    }
+    if (fs.existsSync(dest)) cookiesPathCache = dest;
+  } catch (e) { cookiesPathCache = ''; }
+  return cookiesPathCache || null;
+}
+
+function saveCookieText(text) {
+  const t = String(text || '').replace(/\r\n/g, '\n');
+  const lines = t.split('\n').filter(l => l.trim() && (!l.startsWith('#') || l.startsWith('#HttpOnly_')));
+  if (!lines.length) throw new Error('no cookie lines found (expected Netscape cookies.txt format)');
+  if (!lines.every(l => l.split('\t').length >= 7)) throw new Error('not Netscape format: every cookie line needs 7 tab-separated fields');
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const dest = cookieJarFile();
+  fs.writeFileSync(dest, t.endsWith('\n') ? t : t + '\n', { mode: 0o600 });
+  // an uploaded jar wins over the env copy until the env value changes again
+  try { fs.writeFileSync(dest + '.src', nodeCrypto.createHash('sha1').update(String(process.env.YT_COOKIES_B64 || process.env.YT_COOKIES || '')).digest('hex')); } catch (_) {}
+  resetCookiesCache();
+  return lines.length;
+}
+
+function cookiesInfo() {
+  const f = cookiesPath();
+  if (!f) return { loaded: false };
+  let names = [], ageMinutes = null;
+  try {
+    const raw = fs.readFileSync(f, 'utf8').split('\n').filter(l => l.trim() && (!l.startsWith('#') || l.startsWith('#HttpOnly_')));
+    names = raw.map(l => l.split('\t')[5]).filter(Boolean);
+    ageMinutes = Math.round((Date.now() - fs.statSync(f).mtimeMs) / 60000);
+  } catch (_) {}
+  const key = ['SID', '__Secure-1PSID', '__Secure-3PSID', 'SAPISID', '__Secure-3PAPISID'];
+  return { loaded: true, count: names.length, hasLoginCookies: key.filter(k => names.includes(k)), missingLoginCookies: key.filter(k => !names.includes(k)), updatedMinutesAgo: ageMinutes };
+}
+
+function ytDlpNetworkArgs() {
+  const out = [];
+  const c = cookiesPath();
+  if (c) out.push('--cookies', c);
+  if (process.env.YT_PROXY && process.env.YT_PROXY.trim()) out.push('--proxy', process.env.YT_PROXY.trim());
+  if (process.env.YT_JS_RUNTIME && process.env.YT_JS_RUNTIME.trim()) out.push('--js-runtimes', process.env.YT_JS_RUNTIME.trim());
+  return out;
 }
 
 function clearBinaryCache() {
   Object.keys(binaryCache).forEach((k) => delete binaryCache[k]);
 }
 
-module.exports = {
+module.exports = { saveCookieText, cookiesInfo, resetCookiesCache,
   clearBinaryCache,
   IS_WIN, DATA_DIR, DEFAULT_DATA_DIR, CONFIG_PATH, BIN_DIR, CACHE_DIR, CUSTOM_LYRICS_DIR, LYRICS_DIR, THUMBNAILS_DIR, METADATA_PATH,
   LIBRARY_DIR, LIBRARY_PATH, STARTUP_PATH,
